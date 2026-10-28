@@ -2,6 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "regions": ["bom1"],
   "env": { "WORKER_MODE": "external" },
+  "functions": { "app/main.py": { "includeFiles": "sql/**" } },
   "daemons": {
     "transaction-worker": {
       "root": ".",
