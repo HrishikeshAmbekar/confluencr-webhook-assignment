@@ -2,3 +2,6 @@
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+
+[tool.vercel]
+entrypoint = "app.main:app"

@@ -5,7 +5,7 @@ A Python/FastAPI service that receives transaction webhooks, acknowledges them q
 ## Public links
 
 - GitHub repository: https://github.com/HrishikeshAmbekar/confluencr-webhook-assignment
-- Live API: `https://<your-render-service>.onrender.com`
+- Live API: `<deployment URL>`
 
 Replace the API placeholder after deployment. The API's interactive docs will be available at `/docs`.
 
@@ -16,7 +16,7 @@ Replace the API placeholder after deployment. The API's interactive docs will be
 - **Reliable background processing:** the application stores claims, claim timestamps, and attempt counters in Postgres. The worker uses `FOR UPDATE SKIP LOCKED`; if it is interrupted after claiming a job, a restarted service recovers the stale claim and completes it. No work state is written to local disk.
 - **Concurrent processing:** up to eight jobs wait asynchronously for the simulated external call. New inserts wake the worker immediately; a 30-second scan recovers pending work after interruptions without constant database polling.
 - **Private storage:** the table lives in a private Supabase schema with row security enabled, outside the exposed Data API schemas.
-- **Single process deployment:** the free Render plan provides one web-service instance, so the API and durable worker run in one process. A paid or multi-instance deployment should extract the same claim loop into a dedicated worker service.
+- **Deployment modes:** on Render the API and worker run in one process. On Vercel, the API runs as a function and a separate Vercel daemon runs the same durable worker.
 
 ## API
 
@@ -114,6 +114,16 @@ curl.exe http://127.0.0.1:8000/v1/transactions/txn_abc123def456
 4. Set the `DATABASE_URL` environment variable to the Supabase connection string. Do not paste it into GitHub or the README.
 5. After deployment, open `https://<service>.onrender.com/` once to warm the free instance, then test the webhook and status endpoints.
 6. Replace the public-link placeholders at the top of this README with the actual GitHub and Render URLs.
+
+## Deploy to Vercel and Supabase
+
+1. Create a free Supabase project, preferably in Mumbai to match `vercel.json`, and copy the **Session pooler** URI. Add `sslmode=require`; keep the password private.
+2. Run `sql/schema.sql` in the Supabase SQL editor before the first deployment, so the API and daemon start against an initialized schema.
+3. Import the GitHub repository into a Vercel Hobby project. Set `DATABASE_URL` as a secret production environment variable. The repository config sets `WORKER_MODE=external` for the API and starts one daemon in Mumbai.
+4. Deploy to production. Confirm both the function and daemon are running in Vercel logs before testing. The daemon polls Postgres every two seconds and uses the same durable claims and 30-second simulated work.
+5. Test the public API and update the API URL at the top of this README. In external mode, `GET /` checks API liveness; it does not verify daemon health. If the daemon stops, accepted jobs stay in Postgres and can resume after it restarts.
+
+Vercel Daemons are a beta feature. Hobby usage is free within its quota, but Vercel stops the daemon if that quota is exhausted. Cold starts and network latency can also affect the 500 ms target; measure the live service rather than assuming it meets the target.
 
 ## Security scope
 

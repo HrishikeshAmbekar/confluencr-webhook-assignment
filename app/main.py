@@ -37,14 +37,15 @@ def create_app(
         try:
             await active_store.ensure_schema()
             app.state.store = active_store
-            worker = TransactionWorker(
-                active_store,
-                processing_delay_seconds=settings.processing_delay_seconds,
-                poll_interval_seconds=settings.poll_interval_seconds,
-                claim_timeout_seconds=settings.claim_timeout_seconds,
-                max_concurrent_jobs=settings.max_concurrent_jobs,
-            )
-            worker_task = asyncio.create_task(worker.run(), name="transaction-worker")
+            if settings.worker_mode == "embedded":
+                worker = TransactionWorker(
+                    active_store,
+                    processing_delay_seconds=settings.processing_delay_seconds,
+                    poll_interval_seconds=settings.poll_interval_seconds,
+                    claim_timeout_seconds=settings.claim_timeout_seconds,
+                    max_concurrent_jobs=settings.max_concurrent_jobs,
+                )
+                worker_task = asyncio.create_task(worker.run(), name="transaction-worker")
             app.state.worker = worker
             app.state.worker_task = worker_task
             yield
@@ -65,7 +66,7 @@ def create_app(
 
     @app.get("/", response_model=HealthResponse, tags=["health"])
     async def health_check(request: Request) -> HealthResponse:
-        if request.app.state.worker_task.done():
+        if request.app.state.worker_task is not None and request.app.state.worker_task.done():
             raise HTTPException(status_code=503, detail="Background processor is unavailable")
         return HealthResponse(current_time=datetime.now(UTC))
 
@@ -78,7 +79,7 @@ def create_app(
     async def receive_transaction(
         transaction: TransactionWebhook, request: Request
     ) -> WebhookAcknowledgement:
-        if request.app.state.worker_task.done():
+        if request.app.state.worker_task is not None and request.app.state.worker_task.done():
             raise HTTPException(status_code=503, detail="Background processor is unavailable")
         try:
             inserted = await request.app.state.store.create_transaction(transaction)
@@ -88,7 +89,7 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Transaction storage is temporarily unavailable. Please retry the webhook.",
             ) from exc
-        if inserted:
+        if inserted and request.app.state.worker is not None:
             request.app.state.worker.notify_new_transaction()
         return WebhookAcknowledgement()
 

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from app.worker import TransactionWorker
 from tests.conftest import CrashingClaimStore, FailingInsertStore, FailingMarkOnceStore, MemoryTransactionStore
 
 
@@ -103,6 +104,31 @@ def test_distinct_webhooks_are_claimed_concurrently(payload: dict[str, object]) 
             assert client.post("/v1/webhooks/transactions", json=item).status_code == 202
         wait_until(lambda: store.claim_count == 3)
         assert store.completed_count == 0
+
+
+def test_external_worker_processes_a_persisted_webhook(payload: dict[str, object]) -> None:
+    store = MemoryTransactionStore()
+    settings = FAST_SETTINGS.model_copy(update={"worker_mode": "external"})
+    app = create_app(settings=settings, store=store)
+    worker = TransactionWorker(
+        store,
+        processing_delay_seconds=settings.processing_delay_seconds,
+        poll_interval_seconds=settings.poll_interval_seconds,
+        claim_timeout_seconds=settings.claim_timeout_seconds,
+        max_concurrent_jobs=settings.max_concurrent_jobs,
+    )
+    with TestClient(app) as client:
+        assert client.get("/").status_code == 200
+        assert client.post("/v1/webhooks/transactions", json=payload).status_code == 202
+        assert client.get(f"/v1/transactions/{payload['transaction_id']}").json()[0]["status"] == "PROCESSING"
+        assert client.portal is not None
+        future = client.portal.start_task_soon(worker.run)
+        try:
+            wait_until(lambda: store.completed_count == 1)
+        finally:
+            client.portal.call(worker.stop)
+            future.result(timeout=2)
+        assert client.get(f"/v1/transactions/{payload['transaction_id']}").json()[0]["status"] == "PROCESSED"
 
 
 def test_failed_completion_is_retried_after_claim_expires(payload: dict[str, object]) -> None:

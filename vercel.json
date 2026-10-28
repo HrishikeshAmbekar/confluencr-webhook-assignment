@@ -1,0 +1,12 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["bom1"],
+  "env": { "WORKER_MODE": "external" },
+  "daemons": {
+    "transaction-worker": {
+      "root": ".",
+      "entrypoint": "Dockerfile",
+      "instances": { "bom1": 1 }
+    }
+  }
+}
