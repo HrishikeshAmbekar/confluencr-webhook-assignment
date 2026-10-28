@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
+from app.logging_config import error_type
 from app.storage import StorageError, TransactionClaim, TransactionStore
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("webhook.worker")
 
 
 class TransactionWorker:
@@ -37,6 +39,7 @@ class TransactionWorker:
         self._wake_event.set()
 
     async def run(self) -> None:
+        logger.info("worker.started")
         try:
             while not self._stop_event.is_set():
                 # Clear before querying so notifications arriving during a query are retained.
@@ -44,8 +47,8 @@ class TransactionWorker:
                 while len(self._active_jobs) < self._max_concurrent_jobs:
                     try:
                         claim = await self._store.claim_next_transaction(self._claim_timeout_seconds)
-                    except StorageError:
-                        logger.exception("Unable to claim a transaction; retrying after poll interval")
+                    except StorageError as exc:
+                        logger.error("worker.claim_failed", extra={"error_type": error_type(exc)})
                         break
                     if claim is None:
                         break
@@ -59,23 +62,43 @@ class TransactionWorker:
             for task in self._active_jobs:
                 task.cancel()
             await asyncio.gather(*self._active_jobs, return_exceptions=True)
+            logger.info("worker.stopped")
 
     async def _process(self, claim: TransactionClaim) -> None:
+        context = {"transaction_id": claim.transaction_id, "attempt": claim.attempt}
+        started = time.perf_counter()
+        logger.info("transaction.processing_started", extra=context)
         try:
             await asyncio.sleep(self._processing_delay_seconds)
             completed = await self._store.mark_processed(claim)
-            if not completed:
-                logger.warning("Transaction claim was superseded before completion: %s", claim.transaction_id)
+            if completed:
+                logger.info(
+                    "transaction.processing_completed",
+                    extra={**context, "duration_ms": round((time.perf_counter() - started) * 1000, 2)},
+                )
+            else:
+                logger.warning(
+                    "transaction.claim_superseded",
+                    extra={**context, "duration_ms": round((time.perf_counter() - started) * 1000, 2)},
+                )
         except asyncio.CancelledError:
             # The claim remains durable and will be recovered after its timeout.
+            logger.warning(
+                "transaction.processing_interrupted",
+                extra={**context, "duration_ms": round((time.perf_counter() - started) * 1000, 2)},
+            )
             raise
-        except StorageError:
-            logger.exception("Unable to complete transaction %s; stale-claim recovery will retry it", claim.transaction_id)
+        except Exception as exc:
+            logger.error(
+                "transaction.processing_failed",
+                extra={**context, "error_type": error_type(exc),
+                       "duration_ms": round((time.perf_counter() - started) * 1000, 2)},
+            )
 
     def _on_job_done(self, task: asyncio.Task[None]) -> None:
         self._active_jobs.discard(task)
         if not task.cancelled() and (error := task.exception()) is not None:
-            logger.error("Unexpected worker error: %s", error, exc_info=error)
+            logger.error("worker.job_failed", extra={"error_type": error_type(error)})
         self._wake_event.set()
 
     async def _wait_for_wake(self) -> None:

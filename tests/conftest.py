@@ -37,6 +37,7 @@ class MemoryTransactionStore:
                 "processed_at": None,
                 "claimed_at": None,
                 "claim_token": None,
+                "attempts": 0,
             }
             return True
 
@@ -62,7 +63,12 @@ class MemoryTransactionStore:
                     continue
                 if claimed_at and claimed_at >= now - timedelta(seconds=claim_timeout_seconds):
                     continue
-                claim = TransactionClaim(transaction_id=transaction_id, claim_token=uuid4())
+                row["attempts"] = cast(int, row["attempts"]) + 1
+                claim = TransactionClaim(
+                    transaction_id=transaction_id,
+                    claim_token=uuid4(),
+                    attempt=cast(int, row["attempts"]),
+                )
                 row["claimed_at"] = now
                 row["claim_token"] = claim.claim_token
                 self.claim_count += 1

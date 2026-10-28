@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import json
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -8,8 +11,10 @@ from typing import Callable
 from fastapi.testclient import TestClient
 
 from app.config import Settings
+from app.logging_config import JsonEventFormatter
 from app.main import create_app
 from app.worker import TransactionWorker
+from app.storage import StorageError
 from tests.conftest import CrashingClaimStore, FailingInsertStore, FailingMarkOnceStore, MemoryTransactionStore
 
 
@@ -131,15 +136,25 @@ def test_external_worker_processes_a_persisted_webhook(payload: dict[str, object
         assert client.get(f"/v1/transactions/{payload['transaction_id']}").json()[0]["status"] == "PROCESSED"
 
 
-def test_failed_completion_is_retried_after_claim_expires(payload: dict[str, object]) -> None:
+def test_failed_completion_is_retried_after_claim_expires(payload: dict[str, object], caplog) -> None:
     store = FailingMarkOnceStore()
-    with make_client(store) as client:
-        assert client.post("/v1/webhooks/transactions", json=payload).status_code == 202
-        wait_until(lambda: store.completed_count == 1)
-        response = client.get(f"/v1/transactions/{payload['transaction_id']}")
+    app_logger = logging.getLogger("webhook")
+    app_logger.addHandler(caplog.handler)
+    try:
+        with make_client(store) as client:
+            assert client.post("/v1/webhooks/transactions", json=payload).status_code == 202
+            wait_until(lambda: any(record.getMessage() == "transaction.processing_completed"
+                                   for record in caplog.records))
+            response = client.get(f"/v1/transactions/{payload['transaction_id']}")
+    finally:
+        app_logger.removeHandler(caplog.handler)
 
     assert store.claim_count == 2
     assert response.json()[0]["status"] == "PROCESSED"
+    assert any(record.getMessage() == "transaction.processing_failed" and record.attempt == 1
+               for record in caplog.records)
+    assert any(record.getMessage() == "transaction.processing_completed" and record.attempt == 2
+               for record in caplog.records)
 
 
 def test_conflicting_duplicate_keeps_original_payload(payload: dict[str, object]) -> None:
@@ -209,3 +224,66 @@ def test_unknown_transaction_returns_404() -> None:
         response = client.get("/v1/transactions/not-found")
 
     assert response.status_code == 404
+
+
+def test_structured_logs_trace_processing_without_payload_data(payload: dict[str, object]) -> None:
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    handler.setFormatter(JsonEventFormatter())
+    app_logger = logging.getLogger("webhook")
+    app_logger.addHandler(handler)
+    store = MemoryTransactionStore()
+    private_payload = {**payload, "source_account": "private_source_account"}
+    try:
+        with make_client(store) as client:
+            first = client.post("/v1/webhooks/transactions", json=private_payload)
+            duplicate = client.post("/v1/webhooks/transactions", json=private_payload)
+            wait_until(lambda: '"event":"transaction.processing_completed"' in output.getvalue())
+    finally:
+        app_logger.removeHandler(handler)
+
+    events = [json.loads(line) for line in output.getvalue().splitlines()]
+    names = [event["event"] for event in events]
+    assert "webhook.accepted" in names
+    assert "webhook.duplicate" in names
+    assert "transaction.processing_started" in names
+    assert "transaction.processing_completed" in names
+    accepted = next(event for event in events if event["event"] == "webhook.accepted")
+    completed_request = next(event for event in events if event["event"] == "request.completed"
+                             and event["request_id"] == first.headers["x-request-id"])
+    assert accepted["request_id"] == first.headers["x-request-id"]
+    assert duplicate.headers["x-request-id"] != first.headers["x-request-id"]
+    assert completed_request["status_code"] == 202
+    assert completed_request["route"] == "/v1/webhooks/transactions"
+    assert completed_request["duration_ms"] >= 0
+    completed = next(event for event in events if event["event"] == "transaction.processing_completed")
+    assert completed["transaction_id"] == payload["transaction_id"]
+    assert completed["attempt"] == 1
+    assert completed["duration_ms"] >= 0
+    assert "private_source_account" not in output.getvalue()
+
+
+def test_storage_error_log_does_not_expose_exception_details(payload: dict[str, object]) -> None:
+    class SecretErrorStore(MemoryTransactionStore):
+        async def create_transaction(self, transaction):
+            try:
+                raise RuntimeError("secret-database-url")
+            except RuntimeError as exc:
+                raise StorageError("secret-database-url") from exc
+
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    handler.setFormatter(JsonEventFormatter())
+    app_logger = logging.getLogger("webhook")
+    app_logger.addHandler(handler)
+    try:
+        with make_client(SecretErrorStore()) as client:
+            response = client.post("/v1/webhooks/transactions", json=payload)
+    finally:
+        app_logger.removeHandler(handler)
+
+    events = [json.loads(line) for line in output.getvalue().splitlines()]
+    failure = next(event for event in events if event["event"] == "webhook.persistence_failed")
+    assert response.status_code == 503
+    assert failure["error_type"] == "RuntimeError"
+    assert "secret-database-url" not in output.getvalue()

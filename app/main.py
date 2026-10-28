@@ -2,20 +2,28 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import AsyncIterator
+from uuid import uuid4
 
 import simplejson
 from fastapi import FastAPI, HTTPException, Request, Response, status
 
 from app.config import Settings
+from app.logging_config import configure_logging, error_type
 from app.models import HealthResponse, TransactionResponse, TransactionWebhook, WebhookAcknowledgement
 from app.storage import PostgresTransactionStore, StorageError, TransactionStore
 from app.worker import TransactionWorker
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-logger = logging.getLogger(__name__)
+configure_logging()
+logger = logging.getLogger("webhook.api")
+
+
+def _report_worker_exit(task: asyncio.Task[None]) -> None:
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        logger.error("worker.crashed", extra={"error_type": error_type(exc)})
 
 
 def _json_default(value: object) -> str:
@@ -46,8 +54,10 @@ def create_app(
                     max_concurrent_jobs=settings.max_concurrent_jobs,
                 )
                 worker_task = asyncio.create_task(worker.run(), name="transaction-worker")
+                worker_task.add_done_callback(_report_worker_exit)
             app.state.worker = worker
             app.state.worker_task = worker_task
+            logger.info("service.started", extra={"worker_mode": settings.worker_mode})
             yield
         finally:
             if worker is not None:
@@ -56,6 +66,7 @@ def create_app(
                 worker_task.cancel()
                 await asyncio.gather(worker_task, return_exceptions=True)
             await active_store.close()
+            logger.info("service.stopped", extra={"worker_mode": settings.worker_mode})
 
     app = FastAPI(
         title="Transaction Webhook Service",
@@ -63,6 +74,36 @@ def create_app(
         description="Durable, idempotent processing for incoming transaction webhooks.",
         lifespan=lifespan,
     )
+
+    @app.middleware("http")
+    async def log_request(request: Request, call_next):
+        request.state.request_id = uuid4().hex
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            route = request.scope.get("route")
+            logger.error(
+                "request.failed",
+                extra={"request_id": request.state.request_id, "method": request.method,
+                       "route": getattr(route, "path", "<unmatched>"),
+                       "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                       "error_type": error_type(exc)},
+            )
+            raise
+        route = request.scope.get("route")
+        logger.info(
+            "request.completed",
+            extra={
+                "request_id": request.state.request_id,
+                "method": request.method,
+                "route": getattr(route, "path", "<unmatched>"),
+                "status_code": response.status_code,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+            },
+        )
+        response.headers["X-Request-ID"] = request.state.request_id
+        return response
 
     @app.get("/", response_model=HealthResponse, tags=["health"])
     async def health_check(request: Request) -> HealthResponse:
@@ -84,11 +125,19 @@ def create_app(
         try:
             inserted = await request.app.state.store.create_transaction(transaction)
         except StorageError as exc:
-            logger.exception("Webhook was not acknowledged because it could not be persisted")
+            logger.error(
+                "webhook.persistence_failed",
+                extra={"request_id": request.state.request_id, "transaction_id": transaction.transaction_id,
+                       "error_type": error_type(exc)},
+            )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Transaction storage is temporarily unavailable. Please retry the webhook.",
             ) from exc
+        logger.info(
+            "webhook.accepted" if inserted else "webhook.duplicate",
+            extra={"request_id": request.state.request_id, "transaction_id": transaction.transaction_id},
+        )
         if inserted and request.app.state.worker is not None:
             request.app.state.worker.notify_new_transaction()
         return WebhookAcknowledgement()
@@ -102,6 +151,10 @@ def create_app(
         try:
             transaction = await request.app.state.store.get_transaction(transaction_id)
         except StorageError as exc:
+            logger.error(
+                "transaction.read_failed",
+                extra={"request_id": request.state.request_id, "error_type": error_type(exc)},
+            )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Transaction storage is temporarily unavailable.",

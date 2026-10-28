@@ -7,6 +7,7 @@ import logging
 import signal
 
 from app.config import Settings
+from app.logging_config import configure_logging, error_type
 from app.storage import PostgresTransactionStore
 from app.worker import TransactionWorker
 
@@ -36,5 +37,11 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    asyncio.run(main())
+    configure_logging()
+    try:
+        asyncio.run(main())
+    except Exception as exc:
+        logging.getLogger("webhook.worker").error(
+            "worker.crashed", extra={"error_type": error_type(exc)}
+        )
+        raise SystemExit(1) from None

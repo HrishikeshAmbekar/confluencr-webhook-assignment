@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -8,7 +9,10 @@ from uuid import UUID, uuid4
 
 import asyncpg
 
+from app.logging_config import error_type
 from app.models import TransactionResponse, TransactionStatus, TransactionWebhook
+
+logger = logging.getLogger("webhook.storage")
 
 
 class StorageError(RuntimeError):
@@ -19,6 +23,7 @@ class StorageError(RuntimeError):
 class TransactionClaim:
     transaction_id: str
     claim_token: UUID
+    attempt: int
 
 
 class TransactionStore(Protocol):
@@ -57,7 +62,8 @@ class PostgresTransactionStore:
                 command_timeout=10,
             )
         except Exception as exc:  # asyncpg exposes several connection exception classes.
-            raise StorageError("Could not connect to PostgreSQL") from exc
+            logger.error("storage.connection_failed", extra={"error_type": error_type(exc)})
+            raise StorageError("Could not connect to PostgreSQL") from None
         return cls(pool)
 
     async def ensure_schema(self) -> None:
@@ -66,7 +72,8 @@ class PostgresTransactionStore:
             async with self._pool.acquire() as connection:
                 await connection.execute(schema)
         except Exception as exc:
-            raise StorageError("Could not initialize the transaction schema") from exc
+            logger.error("storage.schema_failed", extra={"error_type": error_type(exc)})
+            raise StorageError("Could not initialize the transaction schema") from None
 
     async def close(self) -> None:
         await self._pool.close()
@@ -128,7 +135,7 @@ class PostgresTransactionStore:
                 attempts = target.attempts + 1
             FROM candidate
             WHERE target.transaction_id = candidate.transaction_id
-            RETURNING target.transaction_id
+            RETURNING target.transaction_id, target.attempts
         """
         try:
             async with self._pool.acquire() as connection:
@@ -137,7 +144,9 @@ class PostgresTransactionStore:
             raise StorageError("Could not claim a transaction for processing") from exc
         if row is None:
             return None
-        return TransactionClaim(transaction_id=row["transaction_id"], claim_token=claim_token)
+        return TransactionClaim(
+            transaction_id=row["transaction_id"], claim_token=claim_token, attempt=row["attempts"]
+        )
 
     async def mark_processed(self, claim: TransactionClaim) -> bool:
         query = """

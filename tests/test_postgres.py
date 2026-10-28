@@ -46,11 +46,13 @@ async def _exercise_postgres(database_url: str) -> None:
 
         first = await store.claim_next_transaction(0.1)
         assert first is not None and first.transaction_id == transaction_id
+        assert first.attempt == 1
         assert await store.claim_next_transaction(0.1) is None
 
         await asyncio.sleep(0.12)
         recovered = await store.claim_next_transaction(0.1)
         assert recovered is not None and recovered.transaction_id == transaction_id
+        assert recovered.attempt == 2
         assert recovered.claim_token != first.claim_token
         assert not await store.mark_processed(first)
         assert await store.mark_processed(recovered)
