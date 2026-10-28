@@ -1,0 +1,12 @@
+services:
+  - type: web
+    runtime: python
+    name: confluencr-webhook-assignment
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false
